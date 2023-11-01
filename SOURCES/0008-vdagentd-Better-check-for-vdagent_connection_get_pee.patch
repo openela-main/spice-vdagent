@@ -1,0 +1,44 @@
+From 64289e71a1b2a9dc6868eb810cf93ca8c0644693 Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <freddy77@gmail.com>
+Date: Mon, 21 Sep 2020 16:42:26 +0100
+Subject: [PATCH vd_agent_linux 08/17] vdagentd: Better check for
+ vdagent_connection_get_peer_pid results
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The function can return -1 and leave "err" to NULL in some cases,
+do not check only for "err".
+
+Signed-off-by: Frediano Ziglio <freddy77@gmail.com>
+Acked-by: Julien Ropé <jrope@redhat.com>
+---
+ src/vdagentd/vdagentd.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/vdagentd/vdagentd.c b/src/vdagentd/vdagentd.c
+index 94b8681..12cbbd0 100644
+--- a/src/vdagentd/vdagentd.c
++++ b/src/vdagentd/vdagentd.c
+@@ -933,10 +933,14 @@ static void agent_connect(UdscsConnection *conn)
+ 
+     if (session_info) {
+         pid = vdagent_connection_get_peer_pid(VDAGENT_CONNECTION(conn), &err);
+-        if (err) {
+-            syslog(LOG_ERR, "Could not get peer PID, disconnecting new client: %s",
+-                            err->message);
+-            g_error_free(err);
++        if (err || pid <= 0) {
++            static const char msg[] = "Could not get peer PID, disconnecting new client";
++            if (err) {
++                syslog(LOG_ERR, "%s: %s", msg, err->message);
++                g_error_free(err);
++            } else {
++                syslog(LOG_ERR, "%s", msg);
++            }
+             agent_data_destroy(agent_data);
+             udscs_server_destroy_connection(server, conn);
+             return;
+-- 
+2.26.2
+

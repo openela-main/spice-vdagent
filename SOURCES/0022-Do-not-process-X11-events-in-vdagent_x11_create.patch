@@ -1,0 +1,33 @@
+From 0717474feca8753bce7b8933bd10b3bab62a2f14 Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <freddy77@gmail.com>
+Date: Sat, 12 Feb 2022 21:12:57 +0000
+Subject: [PATCH] Do not process X11 events in vdagent_x11_create
+
+Processing events requires some more initialisation between
+VDAgentDisplay and vdagent_x11.
+Postpone that after initialisation.
+This fix a crash on Fedora 36, see
+https://bugzilla.redhat.com/show_bug.cgi?id=2042877.
+
+Signed-off-by: Frediano Ziglio <freddy77@gmail.com>
+---
+ src/vdagent/x11.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/src/vdagent/x11.c b/src/vdagent/x11.c
+index 05a41d7..4af4bdc 100644
+--- a/src/vdagent/x11.c
++++ b/src/vdagent/x11.c
+@@ -302,9 +302,6 @@ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+         x11->height[i] = attrib.height;
+     }
+ 
+-    /* Flush output buffers and consume any pending events */
+-    vdagent_x11_do_read(x11);
+-
+     return x11;
+ }
+ 
+-- 
+2.39.0
+

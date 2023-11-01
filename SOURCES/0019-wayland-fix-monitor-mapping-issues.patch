@@ -1,0 +1,2292 @@
+From 2f025381f8c11cab2f351a478fba80ce7ae70a67 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Tue, 25 Feb 2020 12:17:12 +0100
+Subject: [PATCH 1/4] Split X11-specific code from the core agent code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This commit adds a set of functions (vdagent_display_*) that separates the
+agent's code from the underlying backend used for handling monitor
+events/settings.
+Today, this does not change the behaviour of the agent, as those functions
+will just call the existing X11 functions. But we will later add code to
+them to support other means of dealing with monitors (i.e: Wayland
+support).
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ Makefile.am           |   2 +
+ src/vdagent/display.c | 129 ++++++++++++++++++++++++++++++++++++++++++
+ src/vdagent/display.h |  37 ++++++++++++
+ src/vdagent/vdagent.c |  37 ++++--------
+ 4 files changed, 178 insertions(+), 27 deletions(-)
+ create mode 100644 src/vdagent/display.c
+ create mode 100644 src/vdagent/display.h
+
+diff --git a/Makefile.am b/Makefile.am
+index 2abb5ec..431e414 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -43,6 +43,8 @@ src_spice_vdagent_SOURCES =			\
+ 	src/vdagent/clipboard.h			\
+ 	src/vdagent/device-info.c		\
+ 	src/vdagent/device-info.h		\
++	src/vdagent/display.c			\
++	src/vdagent/display.h			\
+ 	src/vdagent/file-xfers.c		\
+ 	src/vdagent/file-xfers.h		\
+ 	src/vdagent/x11-priv.h			\
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+new file mode 100644
+index 0000000..bb83762
+--- /dev/null
++++ b/src/vdagent/display.c
+@@ -0,0 +1,129 @@
++/*  display.c vdagent display source code
++
++ Copyright 2020 Red Hat, Inc.
++
++ Red Hat Authors:
++ Julien Ropé <jrope@redhat.com>
++
++ This program is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++
++#include <glib.h>
++#ifdef WITH_GTK
++#include <gdk/gdk.h>
++#ifdef GDK_WINDOWING_X11
++#include <gdk/gdkx.h>
++#endif
++#endif
++#include <syslog.h>
++#include "x11.h"
++#include "x11-priv.h"
++
++#include "display.h"
++
++/**
++ * VDAgentDisplay and the vdagent_display_*() functions are used as wrappers for display-related
++ * operations.
++ * They allow vdagent code to call generic display functions that are independent from the underlying
++ * API (X11/GTK/etc).
++ *
++ * The display.c file contains the actual implementation and chooses what API will be called.
++ * The x11.c and x11-randr.c files contains the x11-specific functions.
++ */
++struct VDAgentDisplay {
++    struct vdagent_x11 *x11;
++    GIOChannel *x11_channel;
++};
++
++struct vdagent_x11* vdagent_display_get_x11(VDAgentDisplay *display)
++{
++    return display->x11;
++}
++
++static gboolean x11_io_channel_cb(GIOChannel *source, GIOCondition condition, gpointer data)
++{
++    VDAgentDisplay *display = data;
++    vdagent_x11_do_read(display->x11);
++
++    return G_SOURCE_CONTINUE;
++}
++
++VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int sync)
++{
++    VDAgentDisplay *display;
++
++    display = g_new0(VDAgentDisplay, 1);
++    display->x11 = vdagent_x11_create(vdagentd, debug, sync);
++    if (display->x11 == NULL) {
++        g_free(display);
++        return NULL;
++    }
++
++    display->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(display->x11));
++    if (display->x11_channel == NULL) {
++        vdagent_x11_destroy(display->x11, TRUE);
++        g_free(display);
++        return NULL;
++    }
++
++    g_io_add_watch(display->x11_channel, G_IO_IN, x11_io_channel_cb, display);
++
++    return display;
++}
++
++void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected)
++{
++    if (!display) {
++        return;
++    }
++
++    g_clear_pointer(&display->x11_channel, g_io_channel_unref);
++    vdagent_x11_destroy(display->x11, vdagentd_disconnected);
++}
++
++/* Function used to determine the default location to save file-xfers,
++ xdg desktop dir or xdg download dir. We err on the safe side and use a
++ whitelist approach, so any unknown desktop will end up with saving
++ file-xfers to the xdg download dir, and opening the xdg download dir with
++ xdg-open when the file-xfer completes. */
++int vdagent_display_has_icons_on_desktop(VDAgentDisplay *display)
++{
++    return vdagent_x11_has_icons_on_desktop(display->x11);
++}
++
++// handle the device info message from the server. This will allow us to
++// maintain a mapping from spice display id to xrandr output
++void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_t *data,
++        size_t size)
++{
++    vdagent_x11_handle_graphics_device_info(display->x11, data, size);
++}
++
++/*
++ * Set monitor configuration according to client request.
++ *
++ * On exit send current configuration to client, regardless of error.
++ *
++ * Errors:
++ *  screen size too large for driver to handle. (we set the largest/smallest possible)
++ *  no randr support in X server.
++ *  invalid configuration request from client.
++ */
++void vdagent_display_set_monitor_config(VDAgentDisplay *display, VDAgentMonitorsConfig *mon_config,
++        int fallback)
++{
++    vdagent_x11_set_monitor_config(display->x11, mon_config, fallback);
++}
+diff --git a/src/vdagent/display.h b/src/vdagent/display.h
+new file mode 100644
+index 0000000..1f5365f
+--- /dev/null
++++ b/src/vdagent/display.h
+@@ -0,0 +1,37 @@
++/*
++ * display.h- vdagent display handling header
++
++    Copyright 2020 Red Hat, Inc.
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef SRC_VDAGENT_DISPLAY_H_
++#define SRC_VDAGENT_DISPLAY_H_
++
++typedef struct VDAgentDisplay VDAgentDisplay;
++
++VDAgentDisplay *vdagent_display_create(UdscsConnection *vdagentd, int debug, int sync);
++void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected);
++
++int vdagent_display_has_icons_on_desktop(VDAgentDisplay *display);
++void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_t *data, size_t size);
++void vdagent_display_set_monitor_config(VDAgentDisplay *display,
++                                        VDAgentMonitorsConfig *mon_config,
++                                        int fallback);
++
++struct vdagent_x11 *vdagent_display_get_x11(VDAgentDisplay *display);
++
++
++#endif /* SRC_VDAGENT_DISPLAY_H_ */
+diff --git a/src/vdagent/vdagent.c b/src/vdagent/vdagent.c
+index 53b177b..af78328 100644
+--- a/src/vdagent/vdagent.c
++++ b/src/vdagent/vdagent.c
+@@ -38,16 +38,15 @@
+ #include "udscs.h"
+ #include "vdagentd-proto.h"
+ #include "audio.h"
+-#include "x11.h"
+ #include "file-xfers.h"
+ #include "clipboard.h"
++#include "display.h"
+ 
+ typedef struct VDAgent {
+     VDAgentClipboards *clipboards;
+-    struct vdagent_x11 *x11;
++    VDAgentDisplay *display;
+     struct vdagent_file_xfers *xfers;
+     UdscsConnection *conn;
+-    GIOChannel *x11_channel;
+ 
+     GMainLoop *loop;
+ } VDAgent;
+@@ -114,7 +113,7 @@ static const gchar *xfer_get_download_directory(VDAgent *agent)
+         return fx_dir;
+     }
+ 
+-    return g_get_user_special_dir(vdagent_x11_has_icons_on_desktop(agent->x11) ?
++    return g_get_user_special_dir(vdagent_display_has_icons_on_desktop(agent->display) ?
+                                   G_USER_DIRECTORY_DESKTOP :
+                                   G_USER_DIRECTORY_DOWNLOAD);
+ }
+@@ -144,7 +143,7 @@ static gboolean vdagent_init_file_xfer(VDAgent *agent)
+     }
+ 
+     open_dir = fx_open_dir == -1 ?
+-               !vdagent_x11_has_icons_on_desktop(agent->x11) :
++               !vdagent_display_has_icons_on_desktop(agent->display) :
+                fx_open_dir;
+ 
+     agent->xfers = vdagent_file_xfers_create(agent->conn, xfer_dir,
+@@ -179,7 +178,7 @@ static void daemon_read_complete(UdscsConnection *conn,
+ 
+     switch (header->type) {
+     case VDAGENTD_MONITORS_CONFIG:
+-        vdagent_x11_set_monitor_config(agent->x11, (VDAgentMonitorsConfig *)data, 0);
++        vdagent_display_set_monitor_config(agent->display, (VDAgentMonitorsConfig *)data, 0);
+         break;
+     case VDAGENTD_CLIPBOARD_REQUEST:
+         vdagent_clipboard_request(agent->clipboards, header->arg1, header->arg2);
+@@ -249,7 +248,7 @@ static void daemon_read_complete(UdscsConnection *conn,
+         }
+         break;
+     case VDAGENTD_GRAPHICS_DEVICE_INFO:
+-        vdagent_x11_handle_graphics_device_info(agent->x11, data, header->size);
++        vdagent_display_handle_graphics_device_info(agent->display, data, header->size);
+         break;
+     case VDAGENTD_CLIENT_DISCONNECTED:
+         vdagent_clipboards_release_all(agent->clipboards);
+@@ -335,15 +334,7 @@ static int daemonize(void)
+     return 0;
+ }
+ 
+-static gboolean x11_io_channel_cb(GIOChannel *source,
+-                                  GIOCondition condition,
+-                                  gpointer data)
+-{
+-    VDAgent *agent = data;
+-    vdagent_x11_do_read(agent->x11);
+ 
+-    return G_SOURCE_CONTINUE;
+-}
+ 
+ gboolean vdagent_signal_handler(gpointer user_data)
+ {
+@@ -369,13 +360,12 @@ static VDAgent *vdagent_new(void)
+ static void vdagent_destroy(VDAgent *agent)
+ {
+     vdagent_finalize_file_xfer(agent);
+-    vdagent_x11_destroy(agent->x11, agent->conn == NULL);
++    vdagent_display_destroy(agent->display, agent->conn == NULL);
+     g_clear_pointer(&agent->conn, vdagent_connection_destroy);
+ 
+     while (g_source_remove_by_user_data(agent))
+         continue;
+ 
+-    g_clear_pointer(&agent->x11_channel, g_io_channel_unref);
+     g_clear_pointer(&agent->loop, g_main_loop_unref);
+     g_free(agent);
+ }
+@@ -393,22 +383,15 @@ static gboolean vdagent_init_async_cb(gpointer user_data)
+     }
+     g_object_set_data(G_OBJECT(agent->conn), "agent", agent);
+ 
+-    agent->x11 = vdagent_x11_create(agent->conn, debug, x11_sync);
+-    if (agent->x11 == NULL)
+-        goto err_init;
+-    agent->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(agent->x11));
+-    if (agent->x11_channel == NULL)
++    agent->display = vdagent_display_create(agent->conn, debug, x11_sync);
++    if (agent->display == NULL)
+         goto err_init;
+ 
+-    g_io_add_watch(agent->x11_channel,
+-                   G_IO_IN,
+-                   x11_io_channel_cb,
+-                   agent);
+ 
+     if (!vdagent_init_file_xfer(agent))
+         syslog(LOG_WARNING, "File transfer is disabled");
+ 
+-    agent->clipboards = vdagent_clipboards_new(agent->x11);
++    agent->clipboards = vdagent_clipboards_new(vdagent_display_get_x11(agent->display));
+     vdagent_clipboards_set_conn(agent->clipboards, agent->conn);
+ 
+     if (parent_socket != -1) {
+-- 
+2.29.2
+
+
+From aa75e9d7920ffb2290b56fd018789611748f1ea8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Tue, 25 Feb 2020 15:18:41 +0100
+Subject: [PATCH 2/4] Move handle_graphics_device_info code to generic display
+ functions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Most of the code in vdagent_x11_handle_graphics_device_info() is dealing
+with SPICE information, only a few of it is X11-specific.
+Move that code away from x11-randr.c so that we can use it with Wayland.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/display.c   | 33 ++++++++++++++++-
+ src/vdagent/x11-randr.c | 82 +++++++++++++----------------------------
+ src/vdagent/x11.h       |  3 +-
+ 3 files changed, 60 insertions(+), 58 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index bb83762..51b0a0d 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -109,7 +109,38 @@ int vdagent_display_has_icons_on_desktop(VDAgentDisplay *display)
+ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_t *data,
+         size_t size)
+ {
+-    vdagent_x11_handle_graphics_device_info(display->x11, data, size);
++    VDAgentGraphicsDeviceInfo *graphics_device_info = (VDAgentGraphicsDeviceInfo *)data;
++    VDAgentDeviceDisplayInfo *device_display_info = graphics_device_info->display_info;
++
++    void *buffer_end = data + size;
++
++    syslog(LOG_INFO, "Received Graphics Device Info:");
++
++    for (size_t i = 0; i < graphics_device_info->count; ++i) {
++        if ((void*) device_display_info > buffer_end ||
++                (void*) (&device_display_info->device_address +
++                    device_display_info->device_address_len) > buffer_end) {
++            syslog(LOG_ERR, "Malformed graphics_display_info message, "
++                   "extends beyond the end of the buffer");
++            break;
++        }
++
++        // make sure the string is terminated:
++        if (device_display_info->device_address_len > 0) {
++            device_display_info->device_address[device_display_info->device_address_len - 1] = '\0';
++        } else {
++            syslog(LOG_WARNING, "Zero length device_address received for channel_id: %u, monitor_id: %u",
++                   device_display_info->channel_id, device_display_info->monitor_id);
++        }
++
++        vdagent_x11_handle_device_display_info(display->x11, device_display_info);
++
++        device_display_info = (VDAgentDeviceDisplayInfo*) ((char*) device_display_info +
++            sizeof(VDAgentDeviceDisplayInfo) + device_display_info->device_address_len);
++    }
++
++    // make sure daemon is up-to-date with (possibly updated) device IDs
++    vdagent_x11_send_daemon_guest_xorg_res(display->x11, 1);
+ }
+ 
+ /*
+diff --git a/src/vdagent/x11-randr.c b/src/vdagent/x11-randr.c
+index 3fb7a68..9148563 100644
+--- a/src/vdagent/x11-randr.c
++++ b/src/vdagent/x11-randr.c
+@@ -778,64 +778,34 @@ static void dump_monitors_config(struct vdagent_x11 *x11,
+ 
+ // handle the device info message from the server. This will allow us to
+ // maintain a mapping from spice display id to xrandr output
+-void vdagent_x11_handle_graphics_device_info(struct vdagent_x11 *x11, uint8_t *data, size_t size)
++void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
++                                            VDAgentDeviceDisplayInfo *device_display_info)
+ {
+-    VDAgentGraphicsDeviceInfo *graphics_device_info = (VDAgentGraphicsDeviceInfo *)data;
+-    VDAgentDeviceDisplayInfo *device_display_info = graphics_device_info->display_info;
+-
+-    void *buffer_end = data + size;
+-
+-    syslog(LOG_INFO, "Received Graphics Device Info:");
+-
+-    for (size_t i = 0; i < graphics_device_info->count; ++i) {
+-        if ((void*) device_display_info > buffer_end ||
+-                (void*) (&device_display_info->device_address +
+-                    device_display_info->device_address_len) > buffer_end) {
+-            syslog(LOG_ERR, "Malformed graphics_display_info message, "
+-                   "extends beyond the end of the buffer");
+-            break;
+-        }
+-
+-        // make sure the string is terminated:
+-        if (device_display_info->device_address_len > 0) {
+-            device_display_info->device_address[device_display_info->device_address_len - 1] = '\0';
+-        } else {
+-            syslog(LOG_WARNING, "Zero length device_address received for channel_id: %u, monitor_id: %u",
+-                   device_display_info->channel_id, device_display_info->monitor_id);
+-        }
+-
+-        RROutput x_output;
+-        if (lookup_xrandr_output_for_device_info(device_display_info, x11->display,
+-                                                 x11->randr.res, &x_output)) {
+-            gint64 *value = g_new(gint64, 1);
+-            *value = x_output;
+-
+-            syslog(LOG_INFO, "Adding graphics device info: channel_id: %u monitor_id: "
+-                   "%u device_address: %s, device_display_id: %u xrandr output ID: %lu",
+-                   device_display_info->channel_id,
+-                   device_display_info->monitor_id,
+-                   device_display_info->device_address,
+-                   device_display_info->device_display_id,
+-                   x_output);
+-
+-            g_hash_table_insert(x11->guest_output_map,
+-                GUINT_TO_POINTER(device_display_info->channel_id + device_display_info->monitor_id),
+-                value);
+-        } else {
+-            syslog(LOG_INFO, "channel_id: %u monitor_id: %u device_address: %s, "
+-                   "device_display_id: %u xrandr output ID NOT FOUND",
+-                   device_display_info->channel_id,
+-                   device_display_info->monitor_id,
+-                   device_display_info->device_address,
+-                   device_display_info->device_display_id);
+-        }
+-
+-        device_display_info = (VDAgentDeviceDisplayInfo*) ((char*) device_display_info +
+-            sizeof(VDAgentDeviceDisplayInfo) + device_display_info->device_address_len);
++    RROutput x_output;
++    if (lookup_xrandr_output_for_device_info(device_display_info, x11->display,
++                                             x11->randr.res, &x_output)) {
++        gint64 *value = g_new(gint64, 1);
++        *value = x_output;
++
++        syslog(LOG_INFO, "Adding graphics device info: channel_id: %u monitor_id: "
++               "%u device_address: %s, device_display_id: %u xrandr output ID: %lu",
++               device_display_info->channel_id,
++               device_display_info->monitor_id,
++               device_display_info->device_address,
++               device_display_info->device_display_id,
++               x_output);
++
++        g_hash_table_insert(x11->guest_output_map,
++            GUINT_TO_POINTER(device_display_info->channel_id + device_display_info->monitor_id),
++            value);
++    } else {
++        syslog(LOG_INFO, "channel_id: %u monitor_id: %u device_address: %s, "
++               "device_display_id: %u xrandr output ID NOT FOUND",
++               device_display_info->channel_id,
++               device_display_info->monitor_id,
++               device_display_info->device_address,
++               device_display_info->device_display_id);
+     }
+-
+-    // make sure daemon is up-to-date with (possibly updated) device IDs
+-    vdagent_x11_send_daemon_guest_xorg_res(x11, 1);
+ }
+ 
+ static int get_output_index_for_display_id(struct vdagent_x11 *x11, int display_id)
+diff --git a/src/vdagent/x11.h b/src/vdagent/x11.h
+index c49a397..6b3bcc1 100644
+--- a/src/vdagent/x11.h
++++ b/src/vdagent/x11.h
+@@ -51,6 +51,7 @@ void vdagent_x11_client_disconnected(struct vdagent_x11 *x11);
+ #endif
+ 
+ int vdagent_x11_has_icons_on_desktop(struct vdagent_x11 *x11);
+-void vdagent_x11_handle_graphics_device_info(struct vdagent_x11 *x11, uint8_t *data, size_t size);
++void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
++                                            VDAgentDeviceDisplayInfo *device_display_info);
+ 
+ #endif
+-- 
+2.29.2
+
+
+From 1601f4de9533dfe35536f68afc9ca899cf578ae3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Mon, 6 Jul 2020 09:24:10 +0200
+Subject: [PATCH 3/4] Move more code from x11.c to display.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Moving the non-X11 part of the code related to
+"vdagent_x11_has_icon_on_desktop()".
+Turns out most of it is disabled anyway when we build with GTK.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/display.c | 60 ++++++++++++++++++++++++++++++++++++++-----
+ src/vdagent/display.h |  2 +-
+ src/vdagent/x11.c     | 53 +++-----------------------------------
+ src/vdagent/x11.h     |  5 +++-
+ 4 files changed, 62 insertions(+), 58 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index 51b0a0d..5f2ba2c 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -48,6 +48,21 @@ struct VDAgentDisplay {
+     GIOChannel *x11_channel;
+ };
+ 
++
++static gchar *vdagent_display_get_wm_name(VDAgentDisplay *display)
++{
++#ifdef GDK_WINDOWING_X11
++    GdkDisplay *gdk_display = gdk_display_get_default();
++    if (GDK_IS_X11_DISPLAY(gdk_display))
++        return g_strdup(gdk_x11_screen_get_window_manager_name(
++            gdk_display_get_default_screen(gdk_display)));
++    return g_strdup("unsupported");
++#else
++    return vdagent_x11_get_wm_name(display->x11);
++#endif
++}
++
++
+ struct vdagent_x11* vdagent_display_get_x11(VDAgentDisplay *display)
+ {
+     return display->x11;
+@@ -64,6 +79,7 @@ static gboolean x11_io_channel_cb(GIOChannel *source, GIOCondition condition, gp
+ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int sync)
+ {
+     VDAgentDisplay *display;
++    gchar *net_wm_name = NULL;
+ 
+     display = g_new0(VDAgentDisplay, 1);
+     display->x11 = vdagent_x11_create(vdagentd, debug, sync);
+@@ -81,6 +97,21 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+ 
+     g_io_add_watch(display->x11_channel, G_IO_IN, x11_io_channel_cb, display);
+ 
++
++    /* Since we are started at the same time as the wm,
++       sometimes we need to wait a bit for the _NET_WM_NAME to show up. */
++    for (int i = 0; i < 9; i++) {
++        g_free(net_wm_name);
++        net_wm_name = vdagent_display_get_wm_name(display);
++        if (strcmp(net_wm_name, "unknown"))
++            break;
++        usleep(100000);
++    }
++    if (display->x11->debug)
++        syslog(LOG_DEBUG, "%s: net_wm_name=\"%s\", has icons=%d",
++               __func__, net_wm_name, vdagent_display_has_icons_on_desktop(display));
++    g_free(net_wm_name);
++
+     return display;
+ }
+ 
+@@ -95,13 +126,30 @@ void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected)
+ }
+ 
+ /* Function used to determine the default location to save file-xfers,
+- xdg desktop dir or xdg download dir. We err on the safe side and use a
+- whitelist approach, so any unknown desktop will end up with saving
+- file-xfers to the xdg download dir, and opening the xdg download dir with
+- xdg-open when the file-xfer completes. */
+-int vdagent_display_has_icons_on_desktop(VDAgentDisplay *display)
++   xdg desktop dir or xdg download dir. We err on the safe side and use a
++   whitelist approach, so any unknown desktop will end up with saving
++   file-xfers to the xdg download dir, and opening the xdg download dir with
++   xdg-open when the file-xfer completes. */
++gboolean vdagent_display_has_icons_on_desktop(VDAgentDisplay *display)
+ {
+-    return vdagent_x11_has_icons_on_desktop(display->x11);
++    static const char * const wms_with_icons_on_desktop[] = {
++        "Metacity", /* GNOME-2 or GNOME-3 fallback */
++        "Xfwm4",    /* Xfce */
++        "Marco",    /* Mate */
++        "Metacity (Marco)", /* Mate, newer */
++        NULL
++    };
++    gchar *net_wm_name = vdagent_display_get_wm_name(display);
++    int i;
++
++    for (i = 0; wms_with_icons_on_desktop[i]; i++)
++        if (!strcmp(net_wm_name, wms_with_icons_on_desktop[i])) {
++            g_free(net_wm_name);
++            return TRUE;
++        }
++
++    g_free(net_wm_name);
++    return FALSE;
+ }
+ 
+ // handle the device info message from the server. This will allow us to
+diff --git a/src/vdagent/display.h b/src/vdagent/display.h
+index 1f5365f..af165ef 100644
+--- a/src/vdagent/display.h
++++ b/src/vdagent/display.h
+@@ -25,7 +25,7 @@ typedef struct VDAgentDisplay VDAgentDisplay;
+ VDAgentDisplay *vdagent_display_create(UdscsConnection *vdagentd, int debug, int sync);
+ void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected);
+ 
+-int vdagent_display_has_icons_on_desktop(VDAgentDisplay *display);
++gboolean vdagent_display_has_icons_on_desktop(VDAgentDisplay *display);
+ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_t *data, size_t size);
+ void vdagent_display_set_monitor_config(VDAgentDisplay *display,
+                                         VDAgentMonitorsConfig *mon_config,
+diff --git a/src/vdagent/x11.c b/src/vdagent/x11.c
+index 550d097..d171ffd 100644
+--- a/src/vdagent/x11.c
++++ b/src/vdagent/x11.c
+@@ -123,15 +123,8 @@ int vdagent_x11_restore_error_handler(struct vdagent_x11 *x11)
+     return error;
+ }
+ 
+-static gchar *vdagent_x11_get_wm_name(struct vdagent_x11 *x11)
++gchar *vdagent_x11_get_wm_name(struct vdagent_x11 *x11)
+ {
+-#ifdef GDK_WINDOWING_X11
+-    GdkDisplay *display = gdk_display_get_default();
+-    if (GDK_IS_X11_DISPLAY(display))
+-        return g_strdup(gdk_x11_screen_get_window_manager_name(
+-            gdk_display_get_default_screen(display)));
+-    return g_strdup("unsupported");
+-#else
+     Atom type_ret;
+     int format_ret;
+     unsigned long len, remain;
+@@ -193,8 +186,7 @@ static gchar *vdagent_x11_get_wm_name(struct vdagent_x11 *x11)
+     if (net_wm_name == NULL)
+         return g_strdup("unknown");
+     return net_wm_name;
+-#endif
+ }
+ 
+ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+     int debug, int sync)
+@@ -206,7 +198,6 @@ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+ #else
+     int i, j, major, minor;
+ #endif
+-    gchar *net_wm_name = NULL;
+ 
+     x11 = g_new0(struct vdagent_x11, 1);
+     x11->vdagentd = vdagentd;
+@@ -308,19 +299,6 @@ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+     }
+     vdagent_x11_send_daemon_guest_xorg_res(x11, 1);
+ 
+-    /* Since we are started at the same time as the wm,
+-       sometimes we need to wait a bit for the _NET_WM_NAME to show up. */
+-    for (i = 0; i < 9; i++) {
+-        g_free(net_wm_name);
+-        net_wm_name = vdagent_x11_get_wm_name(x11);
+-        if (strcmp(net_wm_name, "unknown"))
+-            break;
+-        usleep(100000);
+-    }
+-    if (x11->debug)
+-        syslog(LOG_DEBUG, "%s: net_wm_name=\"%s\", has icons=%d",
+-               __func__, net_wm_name, vdagent_x11_has_icons_on_desktop(x11));
+-    g_free(net_wm_name);
+ 
+     /* Flush output buffers and consume any pending events */
+     vdagent_x11_do_read(x11);
+@@ -1407,30 +1365,3 @@ void vdagent_x11_client_disconnected(struct vdagent_x11 *x11)
+     }
+ }
+ #endif
+-
+-/* Function used to determine the default location to save file-xfers,
+-   xdg desktop dir or xdg download dir. We err on the safe side and use a
+-   whitelist approach, so any unknown desktop will end up with saving
+-   file-xfers to the xdg download dir, and opening the xdg download dir with
+-   xdg-open when the file-xfer completes. */
+-int vdagent_x11_has_icons_on_desktop(struct vdagent_x11 *x11)
+-{
+-    const char * const wms_with_icons_on_desktop[] = {
+-        "Metacity", /* GNOME-2 or GNOME-3 fallback */
+-        "Xfwm4",    /* Xfce */
+-        "Marco",    /* Mate */
+-        "Metacity (Marco)", /* Mate, newer */
+-        NULL
+-    };
+-    gchar *net_wm_name = vdagent_x11_get_wm_name(x11);
+-    int i;
+-
+-    for (i = 0; wms_with_icons_on_desktop[i]; i++)
+-        if (!strcmp(net_wm_name, wms_with_icons_on_desktop[i])) {
+-            g_free(net_wm_name);
+-            return 1;
+-        }
+-
+-    g_free(net_wm_name);
+-    return 0;
+-}
+diff --git a/src/vdagent/x11.h b/src/vdagent/x11.h
+index 6b3bcc1..6afee7f 100644
+--- a/src/vdagent/x11.h
++++ b/src/vdagent/x11.h
+@@ -50,7 +50,8 @@ void vdagent_x11_clipboard_release(struct vdagent_x11 *x11, uint8_t selection);
+ void vdagent_x11_client_disconnected(struct vdagent_x11 *x11);
+ #endif
+ 
+-int vdagent_x11_has_icons_on_desktop(struct vdagent_x11 *x11);
++gchar *vdagent_x11_get_wm_name(struct vdagent_x11 *x11);
++
+ void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
+                                             VDAgentDeviceDisplayInfo *device_display_info);
+ 
+-- 
+2.29.2
+
+
+From ef54256abff5fabb3158bff34c96781d09e25f45 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Mon, 6 Jul 2020 15:09:00 +0200
+Subject: [PATCH 4/4] Use RROutput directly in guest_output_map.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need to allocate a separate variable - the RROutput value can be used
+directly in the hashtable.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/x11-randr.c | 14 +++++---------
+ src/vdagent/x11.c       |  2 +-
+ 2 files changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/src/vdagent/x11-randr.c b/src/vdagent/x11-randr.c
+index 9148563..6cd9012 100644
+--- a/src/vdagent/x11-randr.c
++++ b/src/vdagent/x11-randr.c
+@@ -414,7 +414,7 @@ static RROutput get_xrandr_output_for_display_id(struct vdagent_x11 *x11, int di
+         gpointer value;
+         if (g_hash_table_lookup_extended(x11->guest_output_map, GINT_TO_POINTER(display_id),
+                                          NULL, &value)) {
+-            return *(gint64*)value;
++            return (RROutput)value;
+         }
+     }
+ 
+@@ -784,9 +784,6 @@ void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
+     RROutput x_output;
+     if (lookup_xrandr_output_for_device_info(device_display_info, x11->display,
+                                              x11->randr.res, &x_output)) {
+-        gint64 *value = g_new(gint64, 1);
+-        *value = x_output;
+-
+         syslog(LOG_INFO, "Adding graphics device info: channel_id: %u monitor_id: "
+                "%u device_address: %s, device_display_id: %u xrandr output ID: %lu",
+                device_display_info->channel_id,
+@@ -797,7 +794,7 @@ void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
+ 
+         g_hash_table_insert(x11->guest_output_map,
+             GUINT_TO_POINTER(device_display_info->channel_id + device_display_info->monitor_id),
+-            value);
++            (gpointer)x_output);
+     } else {
+         syslog(LOG_INFO, "channel_id: %u monitor_id: %u device_address: %s, "
+                "device_display_id: %u xrandr output ID NOT FOUND",
+@@ -1058,12 +1055,11 @@ void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11, int update)
+                 // all down.
+                 RROutput output_id = x11->randr.res->outputs[i];
+                 GHashTableIter iter;
+-                gpointer key, value;
++                gpointer key, other_id;
+                 g_hash_table_iter_init(&iter, x11->guest_output_map);
+                 bool found = false;
+-                while (g_hash_table_iter_next(&iter, &key, &value)) {
+-                    gint64 *other_id = value;
+-                    if (*other_id == output_id) {
++                while (g_hash_table_iter_next(&iter, &key, &other_id)) {
++                    if ((RROutput)other_id == output_id) {
+                         curr.display_id = GPOINTER_TO_INT(key);
+                         g_array_append_val(res_array, curr);
+                         found = true;
+diff --git a/src/vdagent/x11.c b/src/vdagent/x11.c
+index d171ffd..ee0533f 100644
+--- a/src/vdagent/x11.c
++++ b/src/vdagent/x11.c
+@@ -208,7 +206,7 @@ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+     x11->guest_output_map = g_hash_table_new_full(&g_direct_hash,
+                                                   &g_direct_equal,
+                                                   NULL,
+-                                                  &g_free);
++                                                  NULL);
+ 
+ 
+     x11->display = XOpenDisplay(NULL);
+-- 
+2.29.2
+
+From 6e5e6c2ca6dde2fa489344e497c46fcdec364012 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Tue, 24 Mar 2020 18:13:15 +0100
+Subject: [PATCH 1/7] Add a non-X11 function to send the guest resolution to
+ the daemon/server.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The purpose here is to further separate X11-specific code, and have the
+actual sending to the daemon to be out of X11 code, and reusable by
+other APIs.
+
+- Replace vdagent_x11_send_daemon_guest_res() with a function that
+builds
+  and returns the list of monitor resolutions.
+- Create the vdagent_display_send_daemon_guest_res() that uses this to
+  send the resolutions to the daemon.
+- Call this function in place of vdagent_x11_send_daemon_guest_res()
+
+In later commits, we will be able to use a different API to generate
+the list of monitor resolution, without having to change the X11 code.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/display.c   | 37 +++++++++++++++++++-
+ src/vdagent/display.h   |  2 ++
+ src/vdagent/x11-priv.h  |  7 ++--
+ src/vdagent/x11-randr.c | 75 ++++++++++++++++++++++++-----------------
+ src/vdagent/x11.c       |  2 --
+ 5 files changed, 88 insertions(+), 35 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index d34a6e5..f84b1b3 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -35,6 +32,9 @@
+ #include "x11.h"
+ #include "x11-priv.h"
+ 
++#include "device-info.h"
++#include "vdagentd-proto.h"
++
+ #include "display.h"
+ 
+ /**
+@@ -51,6 +51,35 @@ struct VDAgentDisplay {
+     GIOChannel *x11_channel;
+ };
+ 
++void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean update)
++{
++    GArray *res_array;
++    int width, height, screen_count;
++
++    res_array = vdagent_x11_get_resolutions(display->x11, update, &width, &height, &screen_count);
++    if (res_array == NULL) {
++        return;
++    }
++
++    if (display->x11->debug) {
++        syslog(LOG_DEBUG, "Sending guest screen resolutions to vdagentd:");
++        if (res_array->len > screen_count) {
++            syslog(LOG_DEBUG, "(NOTE: list may contain overlapping areas when "
++                              "multiple spice displays show the same guest output)");
++        }
++        struct vdagentd_guest_xorg_resolution *res =
++            (struct vdagentd_guest_xorg_resolution*)res_array->data;
++        for (int i = 0; i < res_array->len; i++) {
++            syslog(LOG_DEBUG, "   display_id=%d - %dx%d%+d%+d",
++                   res[i].display_id, res[i].width, res[i].height, res[i].x, res[i].y);
++        }
++    }
++
++    udscs_write(display->x11->vdagentd, VDAGENTD_GUEST_XORG_RESOLUTION, width, height,
++                (uint8_t *)res_array->data,
++                res_array->len * sizeof(struct vdagentd_guest_xorg_resolution));
++    g_array_free(res_array, TRUE);
++}
+ 
+ static gchar *vdagent_display_get_wm_name(VDAgentDisplay *display)
+ {
+@@ -94,6 +120,8 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+         return NULL;
+     }
+ 
++    display->x11->vdagent_display = display;
++
+     display->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(display->x11));
+     if (display->x11_channel == NULL) {
+         vdagent_x11_destroy(display->x11, TRUE);
+@@ -118,6 +146,7 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+                __func__, net_wm_name, vdagent_display_has_icons_on_desktop(display));
+     g_free(net_wm_name);
+ 
++    vdagent_display_send_daemon_guest_res(display, TRUE);
+     return display;
+ }
+ 
+@@ -194,7 +223,7 @@ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_
+     }
+ 
+     // make sure daemon is up-to-date with (possibly updated) device IDs
+-    vdagent_x11_send_daemon_guest_xorg_res(display->x11, 1);
++    vdagent_display_send_daemon_guest_res(display, TRUE);
+ }
+ 
+ /*
+diff --git a/src/vdagent/display.h b/src/vdagent/display.h
+index af165ef..5858237 100644
+--- a/src/vdagent/display.h
++++ b/src/vdagent/display.h
+@@ -33,5 +33,7 @@ void vdagent_display_set_monitor_config(VDAgentDisplay *display,
+ 
+ struct vdagent_x11 *vdagent_display_get_x11(VDAgentDisplay *display);
+ 
++void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean update);
++
+ 
+ #endif /* SRC_VDAGENT_DISPLAY_H_ */
+diff --git a/src/vdagent/x11-priv.h b/src/vdagent/x11-priv.h
+index f6f7efe..805d124 100644
+--- a/src/vdagent/x11-priv.h
++++ b/src/vdagent/x11-priv.h
+@@ -7,5 +7,6 @@
+ #include <spice/vd_agent.h>
+ 
+ #include <X11/extensions/Xrandr.h>
++#include "display.h"
+ 
+ #ifndef WITH_GTK
+@@ -155,14 +142,16 @@ struct vdagent_x11 {
+     int has_xinerama;
+     int dont_send_guest_xorg_res;
+     GHashTable *guest_output_map;
++
++    VDAgentDisplay *vdagent_display;
+ };
+ 
+ extern int (*vdagent_x11_prev_error_handler)(Display *, XErrorEvent *);
+ extern int vdagent_x11_caught_error;
+ 
+ void vdagent_x11_randr_init(struct vdagent_x11 *x11);
+-void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11,
+-                                            int update);
++GArray *vdagent_x11_get_resolutions(struct vdagent_x11 *x11, gboolean update,
++                                    int *width, int *height, int *system_screen_count);
+ void vdagent_x11_randr_handle_root_size_change(struct vdagent_x11 *x11,
+                                             int screen, int width, int height);
+ int vdagent_x11_randr_handle_event(struct vdagent_x11 *x11,
+diff --git a/src/vdagent/x11-randr.c b/src/vdagent/x11-randr.c
+index b688b55..145e75a 100644
+--- a/src/vdagent/x11-randr.c
++++ b/src/vdagent/x11-randr.c
+@@ -524,7 +524,7 @@ void vdagent_x11_randr_handle_root_size_change(struct vdagent_x11 *x11,
+     x11->width[screen]  = width;
+     x11->height[screen] = height;
+     if (!x11->dont_send_guest_xorg_res) {
+-        vdagent_x11_send_daemon_guest_xorg_res(x11, 1);
++        vdagent_display_send_daemon_guest_res(x11->vdagent_display, TRUE);
+     }
+ }
+ 
+@@ -544,7 +544,7 @@ int vdagent_x11_randr_handle_event(struct vdagent_x11 *x11,
+         case RRNotify: {
+             update_randr_res(x11, 0);
+             if (!x11->dont_send_guest_xorg_res)
+-                vdagent_x11_send_daemon_guest_xorg_res(x11, 1);
++                vdagent_display_send_daemon_guest_res(x11->vdagent_display, TRUE);
+             break;
+         }
+         default:
+@@ -1021,18 +1021,45 @@ void vdagent_x11_set_monitor_config(struct vdagent_x11 *x11,
+     x11->dont_send_guest_xorg_res = 0;
+ 
+ exit:
+-    vdagent_x11_send_daemon_guest_xorg_res(x11, 0);
++    vdagent_display_send_daemon_guest_res(x11->vdagent_display, FALSE);
+ 
+     /* Flush output buffers and consume any pending events */
+     vdagent_x11_do_read(x11);
+     g_free(curr);
+ }
+ 
+-void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11, int update)
++/**
++ * Builds a list of available monitors, associated with their resolutions.
++ *
++ * This function will use the x11->guest_output_map hashtable to map the SPICE display ID to the
++ * XRandr display ID, and make sure we get the right resolution for each SPICE display.
++ * See vdagent_x11_handle_device_display_info() for how this hashtable is populated.
++ *
++ * If the ID can't be matched (which happens when running under XWayland for instance), a default
++ * mapping is made, which assumes the list of X displays are in the same order as the SPICE displays.
++ * This will cause issues if some SPICE displays are not enabled (for instance: display 2 is
++ * enabled, but not display 1, causing a mismatch of IDs).
++ *
++ * Parameters:
++ * x11    - pointer to the X11 structure
++ * update - TRUE if the cached resolutions need to be updated before building the list
++ * width  - full width of the desktop area (containing all the displays)
++ * height - full height of the desktop area (containing all the displays)
++ * system_screen_count - number of displays found on the system. In some situations, this may be
++ *                       different than the number of SPICE displays (for instance: multiple displays
++ *                       overlapping the same area of the desktop).
++ *                       Used for logging/troubleshooting purposes.
++ *
++ * Returns: a GArray of vdagentd_guest_xorg_resolution elements, to be sent to the vdagent daemon.
++ *          NULL if an error occurs.
++ */
++GArray *vdagent_x11_get_resolutions(struct vdagent_x11 *x11, gboolean update,
++                                    int *width, int *height, int *system_screen_count)
+ {
+     GArray *res_array = g_array_new(FALSE, FALSE, sizeof(struct vdagentd_guest_xorg_resolution));
+-    int i, width = 0, height = 0, screen_count = 0;
++    int i, screen_count = 0;
+ 
++    *width = *height = 0;
+     if (x11->has_xrandr) {
+         if (update)
+             update_randr_res(x11, 0);
+@@ -1070,8 +1097,8 @@ void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11, int update)
+                 }
+             }
+         }
+-        width  = x11->width[0];
+-        height = x11->height[0];
++        *width  = x11->width[0];
++        *height = x11->height[0];
+     } else if (x11->has_xinerama) {
+         XineramaScreenInfo *screen_info = NULL;
+ 
+@@ -1085,7 +1112,7 @@ void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11, int update)
+                        screen_info[i].screen_number, screen_count);
+                 XFree(screen_info);
+                 g_array_free(res_array, true);
+-                return;
++                return NULL;
+             }
+             struct vdagentd_guest_xorg_resolution *curr = &g_array_index(res_array,
+                                                                          struct vdagentd_guest_xorg_resolution,
+@@ -1096,8 +1123,8 @@ void vdagent_x11_send_daemon_guest_xorg_res(struct vdagent_x11 *x11, int update)
+             curr->y = screen_info[i].y_org;
+         }
+         XFree(screen_info);
+-        width  = x11->width[0];
+-        height = x11->height[0];
++        *width  = x11->width[0];
++        *height = x11->height[0];
+     } else {
+ no_info:
+         for (i = 0; i < screen_count; i++) {
+@@ -1105,11 +1132,12 @@ no_info:
+             res.width  = x11->width[i];
+             res.height = x11->height[i];
+             /* No way to get screen coordinates, assume rtl order */
+-            res.x = width;
++            res.x = *width;
+             res.y = 0;
+-            width += x11->width[i];
+-            if (x11->height[i] > height)
+-                height = x11->height[i];
++            *width += x11->width[i];
++            if (x11->height[i] > *height) {
++                *height = x11->height[i];
++            }
+             g_array_append_val(res_array, res);
+         }
+     }
+@@ -1117,22 +1145,9 @@ no_info:
+     if (screen_count == 0) {
+         syslog(LOG_DEBUG, "Screen count is zero, are we on wayland?");
+         g_array_free(res_array, TRUE);
+-        return;
+-    }
+-
+-    if (x11->debug) {
+-        syslog(LOG_DEBUG, "Sending guest screen resolutions to vdagentd:");
+-        if (res_array->len > screen_count) {
+-            syslog(LOG_DEBUG, "(NOTE: list may contain overlapping areas when multiple spice displays show the same guest output)");
+-        }
+-        for (i = 0; i < res_array->len; i++) {
+-            struct vdagentd_guest_xorg_resolution *res = (struct vdagentd_guest_xorg_resolution*)res_array->data;
+-            syslog(LOG_DEBUG, "   screen %d %dx%d%+d%+d, display_id=%d", i,
+-                   res[i].width, res[i].height, res[i].x, res[i].y, res[i].display_id);
+-        }
++        return NULL;
+     }
+ 
+-    udscs_write(x11->vdagentd, VDAGENTD_GUEST_XORG_RESOLUTION, width, height,
+-                (uint8_t *)res_array->data, res_array->len * sizeof(struct vdagentd_guest_xorg_resolution));
+-    g_array_free(res_array, TRUE);
++    *system_screen_count = screen_count;
++    return res_array;
+ }
+diff --git a/src/vdagent/x11.c b/src/vdagent/x11.c
+index 58b99b7..b867a5a 100644
+--- a/src/vdagent/x11.c
++++ b/src/vdagent/x11.c
+@@ -301,8 +297,6 @@ struct vdagent_x11 *vdagent_x11_create(UdscsConnection *vdagentd,
+         x11->width[i]  = attrib.width;
+         x11->height[i] = attrib.height;
+     }
+-    vdagent_x11_send_daemon_guest_xorg_res(x11, 1);
+-
+ 
+     /* Flush output buffers and consume any pending events */
+     vdagent_x11_do_read(x11);
+-- 
+2.29.2
+
+
+From f59192a021ffe5a59eba850ccef9c389681579e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Mon, 24 Aug 2020 11:08:43 +0200
+Subject: [PATCH 2/7] Copy the 'debug' flag and 'vdagentd' socket into the
+ VDAgentDisplay structure.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/display.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index f84b1b3..2577f9c 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -51,6 +48,8 @@
+  */
+ struct VDAgentDisplay {
+     struct vdagent_x11 *x11;
++    UdscsConnection *vdagentd;
++    int debug;
+     GIOChannel *x11_channel;
+ };
+ 
+@@ -64,7 +63,7 @@ void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean upd
+         return;
+     }
+ 
+-    if (display->x11->debug) {
++    if (display->debug) {
+         syslog(LOG_DEBUG, "Sending guest screen resolutions to vdagentd:");
+         if (res_array->len > screen_count) {
+             syslog(LOG_DEBUG, "(NOTE: list may contain overlapping areas when "
+@@ -78,7 +77,7 @@ void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean upd
+         }
+     }
+ 
+-    udscs_write(display->x11->vdagentd, VDAGENTD_GUEST_XORG_RESOLUTION, width, height,
++    udscs_write(display->vdagentd, VDAGENTD_GUEST_XORG_RESOLUTION, width, height,
+                 (uint8_t *)res_array->data,
+                 res_array->len * sizeof(struct vdagentd_guest_xorg_resolution));
+     g_array_free(res_array, TRUE);
+@@ -120,6 +116,9 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+     gchar *net_wm_name = NULL;
+ 
+     display = g_new0(VDAgentDisplay, 1);
++    display->vdagentd = vdagentd;
++    display->debug = debug;
++
+     display->x11 = vdagent_x11_create(vdagentd, debug, sync);
+     if (display->x11 == NULL) {
+         g_free(display);
+@@ -147,7 +146,7 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+             break;
+         usleep(100000);
+     }
+-    if (display->x11->debug)
++    if (display->debug)
+         syslog(LOG_DEBUG, "%s: net_wm_name=\"%s\", has icons=%d",
+                __func__, net_wm_name, vdagent_display_has_icons_on_desktop(display));
+     g_free(net_wm_name);
+-- 
+2.29.2
+
+
+From d92f37ae06aafa77b8bc27a458c449c28d0d5f09 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Tue, 24 Mar 2020 16:42:16 +0100
+Subject: [PATCH 3/7] Prepare mapping based on connector name.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Split the lookup_xrandr_output_for_device_info to access the part
+retrieving the expected connector name.
+Call that separate function in the "non-X11" part of the code, and use a
+hashtable to map Spice display ID to its expected connector name.
+This hashtable will later be used when we need to report resolution
+changes to the daemon/server.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/device-info.c | 167 +++++++++++++++++++++++---------------
+ src/vdagent/device-info.h |   4 +
+ src/vdagent/display.c     |  37 ++++++++-
+ 3 files changed, 139 insertions(+), 69 deletions(-)
+
+diff --git a/src/vdagent/device-info.c b/src/vdagent/device-info.c
+index 6b0e28f..8cf72c9 100644
+--- a/src/vdagent/device-info.c
++++ b/src/vdagent/device-info.c
+@@ -388,12 +388,14 @@ static char* find_device_at_pci_address(PciAddress *pci_addr, int *vendor_id, in
+     return NULL;
+ }
+ 
+-// PCI address should be in the following format:
+-//   pci/$domain/$slot.$fn/$slot.$fn
+-bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+-                                          Display *xdisplay,
+-                                          XRRScreenResources *xres,
+-                                          RROutput *output_id)
++
++/**
++ * Look up DRM info for the device, and retrieve the expected connector name.
++ * This name will later be compared to the monitor names found at the display manager level.
++ */
++int get_connector_name_for_device_info(VDAgentDeviceDisplayInfo *device_info,
++                                       char *expected_name, size_t name_size,
++                                       bool has_virtual_zero_display)
+ {
+     PciAddress *user_pci_addr = parse_pci_address_from_spice((char*)device_info->device_address);
+     if (!user_pci_addr) {
+@@ -401,7 +403,7 @@ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+                "Couldn't parse PCI address '%s'. "
+                "Address should be the form 'pci/$domain/$slot.$fn/$slot.fn...",
+                device_info->device_address);
+-        return false;
++        return -1;
+     }
+ 
+     int vendor_id = 0;
+@@ -412,68 +414,106 @@ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+     int drm_fd = open(dev_path, O_RDWR);
+     if (drm_fd < 0) {
+         syslog(LOG_WARNING, "Unable to open file %s", dev_path);
+-        return false;
++        g_free(dev_path);
++        return -1;
+     }
+ 
+     drmModeResPtr res = drmModeGetResources(drm_fd);
+-    if (res) {
+-        // find the drm output that is equal to device_display_id
+-        if (device_info->device_display_id >= res->count_connectors) {
+-            syslog(LOG_WARNING,
+-                   "Specified display id %i is higher than the maximum display id "
+-                   "provided by this device (%i)",
+-                   device_info->device_display_id, res->count_connectors - 1);
+-            close(drm_fd);
+-            return false;
+-        }
++    if (res == NULL) {
++        syslog(LOG_WARNING,
++               "Unable to get DRM resources for card %s. "
++               "Falling back to using xrandr output index.",
++               dev_path);
++        close(drm_fd);
++        g_free(dev_path);
++        return 1;   // error out - actual handling is deferred to the caller
++    }
+ 
+-        drmModeConnectorPtr conn =
+-            drmModeGetConnector(drm_fd, res->connectors[device_info->device_display_id]);
+-        drmModeFreeResources(res);
+-        res = NULL;
++    // no need for dev_path anymore
++    g_free(dev_path);
++
++    // find the drm output that is equal to device_display_id
++    if (device_info->device_display_id >= res->count_connectors) {
++        syslog(LOG_WARNING,
++               "Specified display id %i is higher than the maximum display id "
++               "provided by this device (%i)",
++               device_info->device_display_id, res->count_connectors - 1);
+         close(drm_fd);
++        return -1;
++    }
+ 
+-        if (conn == NULL) {
+-            syslog(LOG_WARNING, "Unable to get drm connector for display id %i",
+-                   device_info->device_display_id);
+-            return false;
+-        }
++    drmModeConnectorPtr conn =
++        drmModeGetConnector(drm_fd, res->connectors[device_info->device_display_id]);
++    drmModeFreeResources(res);
++    res = NULL;
++    close(drm_fd);
+ 
+-        bool decrement_name = false;
+-        if (vendor_id == PCI_VENDOR_ID_REDHAT && device_id == PCI_DEVICE_ID_QXL) {
+-            // Older QXL drivers numbered their outputs starting with
+-            // 0. This contrasts with most drivers who start numbering
+-            // outputs with 1.  In this case, the expected drm connector
+-            // name will need to be decremented before comparing to the
+-            // xrandr output name
+-            for (int i = 0; i < xres->noutput; ++i) {
+-                XRROutputInfo *oinfo = XRRGetOutputInfo(xdisplay, xres, xres->outputs[i]);
+-                if (!oinfo) {
+-                    syslog(LOG_WARNING, "Unable to lookup XRandr output info for output %li",
+-                           xres->outputs[i]);
+-                    return false;
+-                }
+-                if (strcmp(oinfo->name, "Virtual-0") == 0) {
+-                    decrement_name = true;
+-                    XRRFreeOutputInfo(oinfo);
+-                    break;
+-                }
+-                XRRFreeOutputInfo(oinfo);
+-            }
++    if (conn == NULL) {
++        syslog(LOG_WARNING, "Unable to get drm connector for display id %i",
++               device_info->device_display_id);
++        return -1;
++    }
++
++    bool decrement_name = false;
++
++    if (vendor_id == PCI_VENDOR_ID_REDHAT && device_id == PCI_DEVICE_ID_QXL
++        && has_virtual_zero_display) {
++        decrement_name = true;
++    }
++
++    // Compare the name of the xrandr output against what we would
++    // expect based on the drm connection type. The xrandr names
++    // are driver-specific, so we need to special-case some
++    // drivers.  Most hardware these days uses the 'modesetting'
++    // driver, but the QXL device uses its own driver which has
++    // different naming conventions
++    if (vendor_id == PCI_VENDOR_ID_REDHAT && device_id == PCI_DEVICE_ID_QXL) {
++        drm_conn_name_qxl(conn, expected_name, name_size, decrement_name);
++    } else {
++        drm_conn_name_modesetting(conn, expected_name, name_size);
++    }
++    drmModeFreeConnector(conn);
++
++    return 0;
++}
++
++// PCI address should be in the following format:
++//   pci/$domain/$slot.$fn/$slot.$fn
++bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
++                                          Display *xdisplay,
++                                          XRRScreenResources *xres,
++                                          RROutput *output_id)
++{
++    char expected_name[100];
++    int ret;
++
++    // Older QXL drivers numbered their outputs starting with
++    // 0. This contrasts with most drivers who start numbering
++    // outputs with 1.  In this case, the expected drm connector
++    // name will need to be decremented before comparing to the
++    // xrandr output name
++    bool has_virtual_zero_display = false;
++    for (int i = 0; i < xres->noutput; ++i) {
++        XRROutputInfo *oinfo = XRRGetOutputInfo(xdisplay, xres, xres->outputs[i]);
++        if (!oinfo) {
++            syslog(LOG_WARNING, "Unable to lookup XRandr output info for output %li",
++                   xres->outputs[i]);
++            return false;
+         }
+-        // Compare the name of the xrandr output against what we would
+-        // expect based on the drm connection type. The xrandr names
+-        // are driver-specific, so we need to special-case some
+-        // drivers.  Most hardware these days uses the 'modesetting'
+-        // driver, but the QXL device uses its own driver which has
+-        // different naming conventions
+-        char expected_name[100];
+-        if (vendor_id == PCI_VENDOR_ID_REDHAT && device_id == PCI_DEVICE_ID_QXL) {
+-            drm_conn_name_qxl(conn, expected_name, sizeof(expected_name), decrement_name);
+-        } else {
+-            drm_conn_name_modesetting(conn, expected_name, sizeof(expected_name));
++        if (strcmp(oinfo->name, "Virtual-0") == 0) {
++            has_virtual_zero_display = true;
++            XRRFreeOutputInfo(oinfo);
++            break;
+         }
++        XRRFreeOutputInfo(oinfo);
++    }
+ 
++    ret = get_connector_name_for_device_info(device_info, expected_name, sizeof(expected_name),
++                                             has_virtual_zero_display);
++    switch (ret) {
++    case -1:    // generic error => exit
++        return false;
++    case 0:
+         // Loop through xrandr outputs and check whether the xrandr
+         // output name matches the drm connector name
+         for (int i = 0; i < xres->noutput; ++i) {
+@@ -493,13 +533,8 @@ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+             }
+             XRRFreeOutputInfo(oinfo);
+         }
+-        drmModeFreeConnector(conn);
+-    } else {
+-        close(drm_fd);
+-        syslog(LOG_WARNING,
+-               "Unable to get DRM resources for card %s. "
+-               "Falling back to using xrandr output index.",
+-               dev_path);
++        break;
++    case 1:     // no DRM info found
+         // This is probably a proprietary driver (e.g. Nvidia) that does
+         // not provide outputs via drm, so the only thing we can do is just
+         // assume that it is the only device assigned to X, and use the
+diff --git a/src/vdagent/device-info.h b/src/vdagent/device-info.h
+index 8646cc5..d4d8cbd 100644
+--- a/src/vdagent/device-info.h
++++ b/src/vdagent/device-info.h
+@@ -28,3 +28,7 @@ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+                                           Display *xdisplay,
+                                           XRRScreenResources *xres,
+                                           RROutput *output_id);
++
++int get_connector_name_for_device_info(VDAgentDeviceDisplayInfo *device_info,
++                                       char *expected_name, size_t name_size,
++                                       bool has_virtual_zero_display);
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index 2577f9c..b82db5c 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -50,6 +47,8 @@
+  * The x11.c and x11-randr.c files contains the x11-specific functions.
+  */
+ struct VDAgentDisplay {
++    // association between SPICE display ID and expected connector name
++    GHashTable *connector_mapping;
+     struct vdagent_x11 *x11;
+     UdscsConnection *vdagentd;
+     int debug;
+@@ -132,6 +130,7 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+     }
+ 
+     display->x11->vdagent_display = display;
++    display->connector_mapping = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+ 
+     display->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(display->x11));
+     if (display->x11_channel == NULL) {
+@@ -167,6 +168,8 @@ void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected)
+         return;
+     }
+ 
++    g_hash_table_destroy(display->connector_mapping);
++
+     g_clear_pointer(&display->x11_channel, g_io_channel_unref);
+     vdagent_x11_destroy(display->x11, vdagentd_disconnected);
+ }
+@@ -227,6 +232,19 @@ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_
+                    device_display_info->channel_id, device_display_info->monitor_id);
+         }
+ 
++        // Get the expected connector name from hardware info. Store it with the SPICE display ID.
++        char expected_name[100];
++        int ret = get_connector_name_for_device_info(device_display_info, expected_name,
++                                                     sizeof(expected_name), false);
++        if (ret == 0) {
++            g_hash_table_insert(display->connector_mapping,
++                                g_strdup(expected_name),
++                                GUINT_TO_POINTER(device_display_info->channel_id + device_display_info->monitor_id));
++            syslog(LOG_DEBUG, "Mapping connector %s to display #%d", expected_name,
++                   (device_display_info->channel_id + device_display_info->monitor_id));
++        }
++
++        // Also map the SPICE display ID to the corresponding X server object.
+         vdagent_x11_handle_device_display_info(display->x11, device_display_info);
+ 
+         device_display_info = (VDAgentDeviceDisplayInfo*) ((char*) device_display_info +
+-- 
+2.29.2
+
+
+From 4c8009068115b6f89491e0e3e108d38084b2417a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Wed, 29 Apr 2020 16:31:58 +0200
+Subject: [PATCH 4/7] Split the "lookup_xrandr_output_for_device_info()"
+ function to reuse some of it with different backends.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Most display drivers will number their outputs starting with "1", but
+some (like older QXL drivers) will start from 0.
+As we need to map device names with SPICE display IDs, we need to know
+what to expect.
+
+The logic that finds whether we have a O-based index or not is
+independent from the backend, and can be reused outside of the X11
+implementation.
+
+This commit separates this logic for that purpose, to prevent code
+duplication.
+- create the has_zero_based_display_id() function to call whatever the
+  backend, and learn whether our IDs should be decremented or not.
+  Its code is taken out of lookup_xrandr_output_for_device_info()
+- keep the lookup_xrandr_output_for_device_info() for x11 implementation
+- add parameters to some functions to give them the information that IDs
+  should be decremented because of the 0-based index.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Frediano Ziglio <fziglio@redhat.com>
+---
+ src/vdagent/device-info.c | 24 ++---------------
+ src/vdagent/device-info.h |  3 ++-
+ src/vdagent/display.c     | 56 +++++++++++++++++++++++++++++++++++++--
+ src/vdagent/x11-randr.c   |  5 ++--
+ src/vdagent/x11.h         |  3 ++-
+ 5 files changed, 63 insertions(+), 28 deletions(-)
+
+diff --git a/src/vdagent/device-info.c b/src/vdagent/device-info.c
+index 8cf72c9..f07de03 100644
+--- a/src/vdagent/device-info.c
++++ b/src/vdagent/device-info.c
+@@ -482,32 +482,12 @@ int get_connector_name_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+                                           Display *xdisplay,
+                                           XRRScreenResources *xres,
+-                                          RROutput *output_id)
++                                          RROutput *output_id,
++                                          bool has_virtual_zero_display)
+ {
+     char expected_name[100];
+     int ret;
+ 
+-    // Older QXL drivers numbered their outputs starting with
+-    // 0. This contrasts with most drivers who start numbering
+-    // outputs with 1.  In this case, the expected drm connector
+-    // name will need to be decremented before comparing to the
+-    // xrandr output name
+-    bool has_virtual_zero_display = false;
+-    for (int i = 0; i < xres->noutput; ++i) {
+-        XRROutputInfo *oinfo = XRRGetOutputInfo(xdisplay, xres, xres->outputs[i]);
+-        if (!oinfo) {
+-            syslog(LOG_WARNING, "Unable to lookup XRandr output info for output %li",
+-                   xres->outputs[i]);
+-            return false;
+-        }
+-        if (strcmp(oinfo->name, "Virtual-0") == 0) {
+-            has_virtual_zero_display = true;
+-            XRRFreeOutputInfo(oinfo);
+-            break;
+-        }
+-        XRRFreeOutputInfo(oinfo);
+-    }
+-
+     ret = get_connector_name_for_device_info(device_info, expected_name, sizeof(expected_name),
+                                              has_virtual_zero_display);
+     switch (ret) {
+diff --git a/src/vdagent/device-info.h b/src/vdagent/device-info.h
+index d4d8cbd..f90fbe2 100644
+--- a/src/vdagent/device-info.h
++++ b/src/vdagent/device-info.h
+@@ -27,7 +27,8 @@ struct vdagent_x11;
+ bool lookup_xrandr_output_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+                                           Display *xdisplay,
+                                           XRRScreenResources *xres,
+-                                          RROutput *output_id);
++                                          RROutput *output_id,
++                                          bool has_virtual_zero_display);
+ 
+ int get_connector_name_for_device_info(VDAgentDeviceDisplayInfo *device_info,
+                                        char *expected_name, size_t name_size,
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index b82db5c..d556f92 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -212,6 +197,57 @@ gboolean vdagent_display_has_icons_on_desktop(VDAgentDisplay *display)
+     return FALSE;
+ }
+ 
++static bool has_zero_based_display_id(VDAgentDisplay *display)
++{
++    // Older QXL drivers numbered their outputs starting with
++    // 0. This contrasts with most drivers who start numbering
++    // outputs with 1.  In this case, the expected drm connector
++    // name will need to be decremented before comparing to the
++    // display manager output name
++    bool ret = false;
++#ifdef USE_GTK_FOR_MONITORS
++    GdkDisplay *gdk_display = gdk_display_get_default();
++    if (GDK_IS_WAYLAND_DISPLAY(gdk_display)) {
++        gdk_display_sync(gdk_display);
++
++        GListModel *monitors = gdk_display_get_monitors(gdk_display);
++        int screen_count = g_list_model_get_n_items(monitors);
++        for (int i = 0; i < screen_count; i++) {
++            GdkMonitor *monitor = (GdkMonitor *)g_list_model_get_item(monitors, i);
++            const char *name = gdk_monitor_get_connector(monitor);
++            if (!name) {
++                continue;
++            }
++
++            if (strcmp(name, "Virtual-0") == 0) {
++                ret = true;
++                break;
++            }
++        }
++    }
++    else // otherwise, use the X11 code (below)
++#endif
++    {
++        XRRScreenResources *xres = display->x11->randr.res;
++        Display *xdisplay = display->x11->display;
++        for (int i = 0; i < xres->noutput; ++i) {
++            XRROutputInfo *oinfo = XRRGetOutputInfo(xdisplay, xres, xres->outputs[i]);
++            if (!oinfo) {
++                syslog(LOG_WARNING, "Unable to lookup XRandr output info for output %li",
++                       xres->outputs[i]);
++                return false;
++            }
++            if (strcmp(oinfo->name, "Virtual-0") == 0) {
++                ret = true;
++                XRRFreeOutputInfo(oinfo);
++                break;
++            }
++            XRRFreeOutputInfo(oinfo);
++        }
++    }
++    return ret;
++}
++
+ // handle the device info message from the server. This will allow us to
+ // maintain a mapping from spice display id to xrandr output
+ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_t *data,
+@@ -221,6 +257,7 @@ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_
+     VDAgentDeviceDisplayInfo *device_display_info = graphics_device_info->display_info;
+ 
+     void *buffer_end = data + size;
++    bool decrement_id = has_zero_based_display_id(display);
+ 
+     syslog(LOG_INFO, "Received Graphics Device Info:");
+ 
+@@ -246,7 +281,7 @@ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_
+         // Get the expected connector name from hardware info. Store it with the SPICE display ID.
+         char expected_name[100];
+         int ret = get_connector_name_for_device_info(device_display_info, expected_name,
+-                                                     sizeof(expected_name), false);
++                                                     sizeof(expected_name), decrement_id);
+         if (ret == 0) {
+             g_hash_table_insert(display->connector_mapping,
+                                 g_strdup(expected_name),
+@@ -258,7 +291,7 @@ void vdagent_display_handle_graphics_device_info(VDAgentDisplay *display, uint8_
+         }
+ 
+         // Also map the SPICE display ID to the corresponding X server object.
+-        vdagent_x11_handle_device_display_info(display->x11, device_display_info);
++        vdagent_x11_handle_device_display_info(display->x11, device_display_info, decrement_id);
+ 
+         device_display_info = (VDAgentDeviceDisplayInfo*) ((char*) device_display_info +
+             sizeof(VDAgentDeviceDisplayInfo) + device_display_info->device_address_len);
+diff --git a/src/vdagent/x11-randr.c b/src/vdagent/x11-randr.c
+index 145e75a..cac9643 100644
+--- a/src/vdagent/x11-randr.c
++++ b/src/vdagent/x11-randr.c
+@@ -779,11 +779,12 @@ static void dump_monitors_config(struct vdagent_x11 *x11,
+ // handle the device info message from the server. This will allow us to
+ // maintain a mapping from spice display id to xrandr output
+ void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
+-                                            VDAgentDeviceDisplayInfo *device_display_info)
++                                            VDAgentDeviceDisplayInfo *device_display_info,
++                                            gboolean has_virtual_zero_display)
+ {
+     RROutput x_output;
+     if (lookup_xrandr_output_for_device_info(device_display_info, x11->display,
+-                                             x11->randr.res, &x_output)) {
++                                             x11->randr.res, &x_output, has_virtual_zero_display)) {
+         syslog(LOG_INFO, "Adding graphics device info: channel_id: %u monitor_id: "
+                "%u device_address: %s, device_display_id: %u xrandr output ID: %lu",
+                device_display_info->channel_id,
+diff --git a/src/vdagent/x11.h b/src/vdagent/x11.h
+index a75638c..45018bd 100644
+--- a/src/vdagent/x11.h
++++ b/src/vdagent/x11.h
+@@ -53,6 +53,7 @@ void vdagent_x11_client_disconnected(struct vdagent_x11 *x11);
+ gchar *vdagent_x11_get_wm_name(struct vdagent_x11 *x11);
+ 
+ void vdagent_x11_handle_device_display_info(struct vdagent_x11 *x11,
+-                                            VDAgentDeviceDisplayInfo *device_display_info);
++                                            VDAgentDeviceDisplayInfo *device_display_info,
++                                            gboolean has_virtual_zero_display);
+ 
+ #endif
+-- 
+2.29.2
+
+
+From 6c475b368d34f24509bd03412b0a8a4d81a9f2e7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Thu, 26 Mar 2020 15:16:51 +0100
+Subject: [PATCH 5/7] Send guest resolution using GDK functions.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- RHEL 8.4: skeleton implementation of vdagent_gtk_get_resolutions().
+  Do not introduce GTK4 code into RHEL8.4 as this will not be used anyway.
+- Add disabled monitors to the list before sending
+  (vdagent_display_send_daemon_guest_res)
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+---
+ src/vdagent/display.c | 149 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 146 insertions(+), 3 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index d556f92..a6de9c0 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -63,14 +55,76 @@ struct VDAgentDisplay {
+     GIOChannel *x11_channel;
+ };
+ 
++static gint vdagent_guest_xorg_resolution_compare(gconstpointer a, gconstpointer b)
++{
++    struct vdagentd_guest_xorg_resolution *ptr_a, *ptr_b;
++
++    ptr_a = (struct vdagentd_guest_xorg_resolution *)a;
++    ptr_b = (struct vdagentd_guest_xorg_resolution *)b;
++
++    return ptr_a->display_id - ptr_b->display_id;
++}
++
++static GArray *vdagent_gtk_get_resolutions(VDAgentDisplay *display,
++                                           int *width, int *height, int *screen_count)
++{
++    return NULL;
++}
++
+ void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean update)
+ {
+     GArray *res_array;
+-    int width, height, screen_count;
++    int width = 0, height = 0, screen_count = 0;
+ 
+-    res_array = vdagent_x11_get_resolutions(display->x11, update, &width, &height, &screen_count);
++    res_array = vdagent_gtk_get_resolutions(display, &width, &height, &screen_count);
+     if (res_array == NULL) {
+-        return;
++        if (display->x11->dont_send_guest_xorg_res) {
++            return;
++        }
++
++        res_array = vdagent_x11_get_resolutions(display->x11, update,
++                                                &width, &height, &screen_count);
++        if (res_array == NULL) {
++            return;
++        }
+     }
++
++    if (res_array->len < g_hash_table_size(display->connector_mapping)) {
++        // Complete the array with disabled displays.
++        // We need to send 0x0 resolution to let the daemon know the display is not there anymore.
++
++        syslog(LOG_DEBUG, "%d/%d displays found - completing with disabled displays.",
++               res_array->len, g_hash_table_size(display->connector_mapping));
++
++        GHashTableIter iter;
++        gpointer key, value;
++        g_hash_table_iter_init(&iter, display->connector_mapping);
++        while (g_hash_table_iter_next(&iter, &key, &value)) {
++            bool found = false;
++            int display_id = GPOINTER_TO_INT(value);
++            for (int i = 0; i < res_array->len; i++) {
++                struct vdagentd_guest_xorg_resolution *res =
++                    (struct vdagentd_guest_xorg_resolution*)res_array->data;
++                if (res[i].display_id == display_id) {
++                    found = true;
++                    break;
++                }
++            }
++            if (!found) {
++                struct vdagentd_guest_xorg_resolution res;
++
++                res.x = 0;
++                res.y = 0;
++                res.height = 0;
++                res.width = 0;
++                res.display_id = display_id;
++
++                g_array_append_val(res_array, res);
++            }
++        }
++    }
++
++    // sort the list to make sure we send them in the display_id order
++    g_array_sort(res_array, vdagent_guest_xorg_resolution_compare);
+ 
+     if (display->debug) {
+@@ -183,6 +231,7 @@ void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected)
+ 
+     g_clear_pointer(&display->x11_channel, g_io_channel_unref);
+     vdagent_x11_destroy(display->x11, vdagentd_disconnected);
++    g_free(display);
+ }
+ 
+ /* Function used to determine the default location to save file-xfers,
+-- 
+2.29.2
+
+
+From 73bf8367268e7ef5a00fd23674b0a8700d0e4a85 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Mon, 12 Oct 2020 10:07:42 +0200
+Subject: [PATCH 3/4] Add implementation of the DBUS interface to Mutter.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This can be used to retrieve monitor resolutions directly from the
+Mutter compositor under Wayland.
+Under environments using a different compositor, the X11 lib will keep
+being used.
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Jakub Janků <jjanku@redhat.com>
+---
+ Makefile.am          |   2 +
+ src/vdagent/mutter.c | 276 +++++++++++++++++++++++++++++++++++++++++++
+ src/vdagent/mutter.h |  33 ++++++
+ 3 files changed, 311 insertions(+)
+ create mode 100644 src/vdagent/mutter.c
+ create mode 100644 src/vdagent/mutter.h
+
+diff --git a/Makefile.am b/Makefile.am
+index 47d7820..e8fa4a6 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -49,6 +47,8 @@ src_spice_vdagent_SOURCES =			\
+ 	src/vdagent/display.h			\
+ 	src/vdagent/file-xfers.c		\
+ 	src/vdagent/file-xfers.h		\
++	src/vdagent/mutter.c			\
++	src/vdagent/mutter.h			\
+ 	src/vdagent/x11-priv.h			\
+ 	src/vdagent/x11-randr.c			\
+ 	src/vdagent/x11.c			\
+diff --git a/src/vdagent/mutter.c b/src/vdagent/mutter.c
+new file mode 100644
+index 0000000..f6ff11b
+--- /dev/null
++++ b/src/vdagent/mutter.c
+@@ -0,0 +1,276 @@
++/* mutter.c - implements the DBUS interface to mutter
++
++ Copyright 2020 Red Hat, Inc.
++
++ Red Hat Authors:
++ Julien Ropé <jrope@redhat.com>
++
++ This program is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++
++#include <glib.h>
++#include <gio/gio.h>
++
++#include <syslog.h>
++
++#include "vdagentd-proto.h"
++#include "mutter.h"
++
++// MUTTER DBUS FORMAT STRINGS
++#define MODE_BASE_FORMAT "siiddad"
++#define MODE_FORMAT "(" MODE_BASE_FORMAT "a{sv})"
++#define MODES_FORMAT "a" MODE_FORMAT
++#define MONITOR_SPEC_FORMAT "(ssss)"
++#define MONITOR_FORMAT "(" MONITOR_SPEC_FORMAT MODES_FORMAT "a{sv})"
++#define MONITORS_FORMAT "a" MONITOR_FORMAT
++
++#define LOGICAL_MONITOR_MONITORS_FORMAT "a" MONITOR_SPEC_FORMAT
++#define LOGICAL_MONITOR_FORMAT "(iidub" LOGICAL_MONITOR_MONITORS_FORMAT "a{sv})"
++#define LOGICAL_MONITORS_FORMAT "a" LOGICAL_MONITOR_FORMAT
++
++#define CURRENT_STATE_FORMAT "(u" MONITORS_FORMAT LOGICAL_MONITORS_FORMAT "a{sv})"
++
++
++struct VDAgentMutterDBus {
++    GDBusProxy *dbus_proxy;
++    GHashTable *connector_mapping;
++};
++
++/**
++ * Initialise a communication to Mutter through its DBUS interface.
++ *
++ * Errors can indicate that another compositor is used. This is not a blocker, and we should default
++ * to use a different API then.
++ *
++ * Returns:
++ * An initialise VDAgentMutterDBus structure if successful.
++ * NULL if an error occured.
++ */
++VDAgentMutterDBus *vdagent_mutter_create(GHashTable *connector_mapping)
++{
++    GError *error = NULL;
++    VDAgentMutterDBus *mutter = g_new0(VDAgentMutterDBus, 1);
++
++    mutter->connector_mapping = g_hash_table_ref(connector_mapping);
++
++    GDBusProxyFlags flags = (G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START
++                            | G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES
++                            | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS);
++
++    mutter->dbus_proxy = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SESSION,
++                                                       flags,
++                                                       NULL,
++                                                       "org.gnome.Mutter.DisplayConfig",
++                                                       "/org/gnome/Mutter/DisplayConfig",
++                                                       "org.gnome.Mutter.DisplayConfig",
++                                                       NULL,
++                                                       &error);
++    if (!mutter->dbus_proxy) {
++        syslog(LOG_WARNING, "display: failed to create dbus proxy: %s", error->message);
++        g_clear_error(&error);
++        vdagent_mutter_destroy(mutter);
++        return NULL;
++    }
++
++    return mutter;
++}
++
++
++void vdagent_mutter_destroy(VDAgentMutterDBus *mutter)
++{
++    g_clear_object(&mutter->dbus_proxy);
++    g_hash_table_unref(mutter->connector_mapping);
++    g_free(mutter);
++}
++
++/** Look through a list of logical monitor to find the one provided.
++ *  Returns the corresponding x and y position of the monitor on the desktop.
++ *  This function is a helper to vdagent_mutter_get_resolution().
++ *
++ *  Parameters:
++ *  logical_monitor: initialized GVariant iterator. It will be copied to look through the items
++ *                   so that its original position is not modified.
++ *  connector: name of the connector that must be found
++ *  x and y: will received the found position
++ *
++ */
++static void vdagent_mutter_get_monitor_position(GVariantIter *logical_monitors,
++                                                const gchar *connector, int *x, int *y)
++{
++    GVariant *logical_monitor = NULL;
++    GVariantIter *logical_monitor_iterator = g_variant_iter_copy(logical_monitors);
++    while (g_variant_iter_next(logical_monitor_iterator, "@"LOGICAL_MONITOR_FORMAT,
++                               &logical_monitor)) {
++        GVariantIter *tmp_monitors = NULL;
++
++        g_variant_get_child(logical_monitor, 0, "i", x);
++        g_variant_get_child(logical_monitor, 1, "i", y);
++        g_variant_get_child(logical_monitor, 5, LOGICAL_MONITOR_MONITORS_FORMAT, &tmp_monitors);
++
++        g_variant_unref(logical_monitor);
++
++        GVariant *tmp_monitor = NULL;
++        gboolean found = FALSE;
++        while (!found && g_variant_iter_next(tmp_monitors, "@"MONITOR_SPEC_FORMAT, &tmp_monitor)) {
++            const gchar *tmp_connector;
++
++            g_variant_get_child(tmp_monitor, 0, "&s", &tmp_connector);
++
++            if (g_strcmp0(connector, tmp_connector) == 0) {
++                found = TRUE;
++            }
++            g_variant_unref(tmp_monitor);
++        }
++
++        g_variant_iter_free(tmp_monitors);
++
++        if (found) {
++            break;
++        }
++        *x = *y = 0;
++    }
++    g_variant_iter_free(logical_monitor_iterator);
++}
++
++GArray *vdagent_mutter_get_resolutions(VDAgentMutterDBus *mutter,
++                                       int *desktop_width, int *desktop_height, int *screen_count)
++{
++    GError *error = NULL;
++    GArray *res_array = NULL;
++
++    // keep track of monitors we find and are not mapped to SPICE displays
++    // we will map them back later (assuming display ID == monitor index)
++    // this prevents the need from looping twice on all DBUS items
++    GArray *not_found_array = NULL;
++
++    if (!mutter) {
++        return res_array;
++    }
++
++    GVariant *values = g_dbus_proxy_call_sync(mutter->dbus_proxy,
++                                              "GetCurrentState",
++                                              NULL,
++                                              G_DBUS_CALL_FLAGS_NONE,
++                                              -1,   // use proxy default timeout
++                                              NULL,
++                                              &error);
++    if (!values) {
++        syslog(LOG_WARNING, "display: failed to call GetCurrentState from mutter over DBUS");
++        if (error != NULL) {
++            syslog(LOG_WARNING, "   error message: %s", error->message);
++            g_clear_error(&error);
++        }
++        return res_array;
++    }
++
++    res_array = g_array_new(FALSE, FALSE, sizeof(struct vdagentd_guest_xorg_resolution));
++    not_found_array = g_array_new(FALSE, FALSE, sizeof(struct vdagentd_guest_xorg_resolution));
++
++    GVariantIter *monitors = NULL;
++    GVariantIter *logical_monitors = NULL;
++
++    g_variant_get_child(values, 1, MONITORS_FORMAT, &monitors);
++    g_variant_get_child(values, 2, LOGICAL_MONITORS_FORMAT, &logical_monitors);
++
++    // list monitors
++    GVariant *monitor = NULL;
++    *screen_count = g_variant_iter_n_children(monitors);
++
++    while (g_variant_iter_next(monitors, "@"MONITOR_FORMAT, &monitor)) {
++
++        const gchar *connector = NULL;
++        GVariantIter *modes = NULL;
++        GVariant *monitor_specs = NULL;
++
++        g_variant_get_child(monitor, 0, "@"MONITOR_SPEC_FORMAT, &monitor_specs);
++        g_variant_get_child(monitor_specs, 0, "&s", &connector);
++        g_variant_get_child(monitor, 1, MODES_FORMAT, &modes);
++
++        g_variant_unref(monitor_specs);
++        g_variant_unref(monitor);
++
++        // list modes
++        GVariant *mode = NULL;
++        while (g_variant_iter_next(modes, "@"MODE_FORMAT, &mode)) {
++            GVariant *properties = NULL;
++            gboolean is_current;
++
++            g_variant_get_child(mode, 6, "@a{sv}", &properties);
++            if (!g_variant_lookup(properties, "is-current", "b", &is_current)) {
++                is_current = FALSE;
++            }
++            g_variant_unref(properties);
++
++            if (!is_current) {
++                g_variant_unref(mode);
++                continue;
++            }
++
++            struct vdagentd_guest_xorg_resolution curr;
++            vdagent_mutter_get_monitor_position(logical_monitors, connector, &curr.x, &curr.y);
++            g_variant_get_child(mode, 1, "i", &curr.width);
++            g_variant_get_child(mode, 2, "i", &curr.height);
++            g_variant_unref(mode);
++
++            // compute the size of the desktop based on the dimension of the monitors
++            if (curr.x + curr.width > *desktop_width) {
++                *desktop_width = curr.x + curr.width;
++            }
++            if (curr.y + curr.height > *desktop_height) {
++                *desktop_height = curr.y + curr.height;
++            }
++
++            gpointer value;
++            if (g_hash_table_lookup_extended(mutter->connector_mapping, connector, NULL, &value)) {
++                curr.display_id = GPOINTER_TO_UINT(value);
++                syslog(LOG_DEBUG,
++                       "Found monitor %s with geometry %dx%d+%d-%d - associating it to SPICE display #%d",
++                       connector, curr.width, curr.height, curr.x, curr.y, curr.display_id);
++                g_array_append_val(res_array, curr);
++            } else {
++                syslog(LOG_DEBUG, "No SPICE display found for connector %s", connector);
++                g_array_append_val(not_found_array, curr);
++            }
++
++            break;
++        }
++        g_variant_iter_free(modes);
++    }
++
++    g_variant_iter_free(logical_monitors);
++    g_variant_iter_free(monitors);
++
++    int i;
++
++    if (res_array->len == 0) {
++        syslog(LOG_DEBUG, "%s: No Spice display ID matching - assuming display ID == Monitor index",
++                __FUNCTION__);
++        g_array_free(res_array, TRUE);
++        res_array = not_found_array;
++
++        struct vdagentd_guest_xorg_resolution *res;
++        res = (struct vdagentd_guest_xorg_resolution*)res_array->data;
++        for (i = 0; i < res_array->len; i++) {
++            res[i].display_id = i;
++        }
++    }
++    else {
++        g_array_free(not_found_array, TRUE);
++    }
++
++    g_variant_unref(values);
++    return res_array;
++}
+diff --git a/src/vdagent/mutter.h b/src/vdagent/mutter.h
+new file mode 100644
+index 0000000..abd2bd2
+--- /dev/null
++++ b/src/vdagent/mutter.h
+@@ -0,0 +1,33 @@
++/* mutter.h - implements the DBUS interface to mutter
++
++ Copyright 2020 Red Hat, Inc.
++
++ Red Hat Authors:
++ Julien Ropé <jrope@redhat.com>
++
++ This program is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef SRC_VDAGENT_MUTTER_H_
++#define SRC_VDAGENT_MUTTER_H_
++
++typedef struct VDAgentMutterDBus VDAgentMutterDBus;
++
++VDAgentMutterDBus *vdagent_mutter_create(GHashTable *connector_mapping);
++void vdagent_mutter_destroy(VDAgentMutterDBus *mutter);
++
++GArray *vdagent_mutter_get_resolutions(VDAgentMutterDBus *mutter, int *width, int *height, int *screen_count);
++
++
++#endif /* SRC_VDAGENT_MUTTER_H_ */
+-- 
+2.29.2
+
+
+From 58d97554e52be79f450c4da664c2191966bf60a9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julien=20Rop=C3=A9?= <jrope@redhat.com>
+Date: Mon, 12 Oct 2020 14:55:51 +0200
+Subject: [PATCH 4/4] Use the Mutter API from display.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Julien Ropé <jrope@redhat.com>
+Acked-by: Jakub Janků <jjanku@redhat.com>
+---
+ src/vdagent/display.c | 32 ++++++++++++++++++++++----------
+ 1 file changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/src/vdagent/display.c b/src/vdagent/display.c
+index 9569173..790d9ad 100644
+--- a/src/vdagent/display.c
++++ b/src/vdagent/display.c
+@@ -41,6 +35,7 @@
+ #include "device-info.h"
+ #include "vdagentd-proto.h"
+ 
++#include "mutter.h"
+ #include "display.h"
+ 
+ /**
+@@ -59,6 +54,7 @@ struct VDAgentDisplay {
+     UdscsConnection *vdagentd;
+     int debug;
+     GIOChannel *x11_channel;
++    VDAgentMutterDBus *mutter;
+ };
+ 
+ static gint vdagent_guest_xorg_resolution_compare(gconstpointer a, gconstpointer b)
+@@ -161,17 +78,22 @@ void vdagent_display_send_daemon_guest_res(VDAgentDisplay *display, gboolean upd
+     GArray *res_array;
+     int width = 0, height = 0, screen_count = 0;
+ 
+-    res_array = vdagent_gtk_get_resolutions(display, &width, &height, &screen_count);
++    // Try various backends one after the other.
++    // We try Mutter first, because it has a bigger probability of being available.
++    // Second GTK, because if/when we build with GTK4, this is the one that will work best.
++    // Finally we try X11. This is the default, and should work OK in most circumstances.
++    res_array = vdagent_mutter_get_resolutions(display->mutter, &width, &height, &screen_count);
++
+     if (res_array == NULL) {
+-        if (display->x11->dont_send_guest_xorg_res) {
+-            return;
+-        }
++        res_array = vdagent_gtk_get_resolutions(display, &width, &height, &screen_count);
++    }
+ 
+-        res_array = vdagent_x11_get_resolutions(display->x11, update,
+-                                                &width, &height, &screen_count);
+-        if (res_array == NULL) {
+-            return;
+-        }
++    if (res_array == NULL) {
++        res_array = vdagent_x11_get_resolutions(display->x11, update, &width, &height, &screen_count);
++    }
++
++    if (res_array == NULL) {
++        return;
+     }
+ 
+     if (res_array->len < g_hash_table_size(display->connector_mapping)) {
+@@ -280,6 +199,8 @@ VDAgentDisplay* vdagent_display_create(UdscsConnection *vdagentd, int debug, int
+     display->x11->vdagent_display = display;
+     display->connector_mapping = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+ 
++    display->mutter = vdagent_mutter_create(display->connector_mapping);
++
+     display->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(display->x11));
+     if (display->x11_channel == NULL) {
+         vdagent_x11_destroy(display->x11, TRUE);
+@@ -314,10 +235,13 @@ void vdagent_display_destroy(VDAgentDisplay *display, int vdagentd_disconnected)
+         return;
+     }
+ 
+-    g_hash_table_destroy(display->connector_mapping);
+ 
+     g_clear_pointer(&display->x11_channel, g_io_channel_unref);
+     vdagent_x11_destroy(display->x11, vdagentd_disconnected);
++
++    vdagent_mutter_destroy(display->mutter);
++
++    g_hash_table_destroy(display->connector_mapping);
+     g_free(display);
+ }
+ 
+-- 
+2.29.2
+

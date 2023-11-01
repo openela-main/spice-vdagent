@@ -1,0 +1,31 @@
+From 7a9ae6219c5a114edcfd1ccb5db04568e47c94aa Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <freddy77@gmail.com>
+Date: Mon, 11 May 2020 10:47:49 +0100
+Subject: [PATCH 4/4] Fix possible compile error using former GLib2 version
+
+We require GLib 2.50 but G_SOURCE_FUNC was introduced in version
+2.58. Do the conversion instead of using G_SOURCE_FUNC macro.
+
+Signed-off-by: Frediano Ziglio <freddy77@gmail.com>
+Acked-by: Victor Toso <victortoso@redhat.com>
+(cherry picked from commit d0b5f80adaef757ebfa81d1ab1c6561697243dc9)
+---
+ src/vdagent-connection.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vdagent-connection.c b/src/vdagent-connection.c
+index 8c023e2..c085d81 100644
+--- a/src/vdagent-connection.c
++++ b/src/vdagent-connection.c
+@@ -231,7 +231,7 @@ void vdagent_connection_write(VDAgentConnection *self,
+         out = G_POLLABLE_OUTPUT_STREAM(g_io_stream_get_output_stream(priv->io_stream));
+ 
+         source = g_pollable_output_stream_create_source(out, priv->cancellable);
+-        g_source_set_callback(source, G_SOURCE_FUNC(out_stream_ready_cb),
++        g_source_set_callback(source, (GSourceFunc) out_stream_ready_cb,
+             g_object_ref(self), NULL);
+         g_source_attach(source, NULL);
+         g_source_unref(source);
+-- 
+2.26.1
+

@@ -1,0 +1,49 @@
+From dd46157d3faa95a12fc6f04cd2515f200e3ca465 Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <freddy77@gmail.com>
+Date: Thu, 24 Sep 2020 12:13:24 +0100
+Subject: [PATCH vd_agent_linux 09/17] vdagentd: Avoid calling chmod
+
+Create the socket with the right permissions using umask.
+This also prevents possible symlink exploitation in case socket
+path is not secure.
+
+Signed-off-by: Frediano Ziglio <freddy77@gmail.com>
+Acked-by: Uri Lublin <uril@redhat.com>
+---
+ src/vdagentd/vdagentd.c | 12 ++----------
+ 1 file changed, 2 insertions(+), 10 deletions(-)
+
+diff --git a/src/vdagentd/vdagentd.c b/src/vdagentd/vdagentd.c
+index 12cbbd0..eddfcf6 100644
+--- a/src/vdagentd/vdagentd.c
++++ b/src/vdagentd/vdagentd.c
+@@ -1211,7 +1211,9 @@ int main(int argc, char *argv[])
+     /* systemd socket activation not enabled, create our own */
+ #endif /* WITH_SYSTEMD_SOCKET_ACTIVATION */
+     {
++        mode_t mode = umask(0111);
+         udscs_server_listen_to_address(server, vdagentd_socket, &err);
++        umask(mode);
+     }
+ 
+     if (err) {
+@@ -1222,16 +1224,6 @@ int main(int argc, char *argv[])
+         return 1;
+     }
+ 
+-    /* no need to set permissions on a socket that was provided by systemd */
+-    if (own_socket) {
+-        if (chmod(vdagentd_socket, 0666)) {
+-            syslog(LOG_CRIT, "Fatal could not change permissions on %s: %m",
+-                   vdagentd_socket);
+-            udscs_destroy_server(server);
+-            return 1;
+-        }
+-    }
+-
+ #ifdef WITH_STATIC_UINPUT
+     uinput = vdagentd_uinput_create(uinput_device, 1024, 768, NULL, 0,
+                                     debug > 1, uinput_fake);
+-- 
+2.26.2
+
