@@ -1,0 +1,62 @@
+From 1aa2c06015e15f707ba9f874d5a5ea49fd450745 Mon Sep 17 00:00:00 2001
+From: Victor Toso <victortoso@redhat.com>
+Date: Wed, 1 Dec 2021 20:07:22 +0100
+Subject: [PATCH 2/3] vdagent: udscs: limit retry to connect to vdagentd
+
+Related: https://bugzilla.redhat.com/show_bug.cgi?id=2005802
+Related: https://bugzilla.redhat.com/show_bug.cgi?id=2028013
+Signed-off-by: Victor Toso <victortoso@redhat.com>
+---
+ src/vdagent/vdagent.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/vdagent/vdagent.c b/src/vdagent/vdagent.c
+index fd08522..0d3945e 100644
+--- a/src/vdagent/vdagent.c
++++ b/src/vdagent/vdagent.c
+@@ -42,11 +42,14 @@
+ #include "clipboard.h"
+ #include "display.h"
+ 
++#define MAX_RETRY_CONNECT_SYSTEM_AGENT 60
++
+ typedef struct VDAgent {
+     VDAgentClipboards *clipboards;
+     VDAgentDisplay *display;
+     struct vdagent_file_xfers *xfers;
+     UdscsConnection *conn;
++    gint udscs_num_retry;
+ 
+     GMainLoop *loop;
+ } VDAgent;
+@@ -378,9 +381,27 @@ static gboolean vdagent_init_async_cb(gpointer user_data)
+                                 daemon_read_complete, daemon_error_cb,
+                                 debug);
+     if (agent->conn == NULL) {
++        if (agent->udscs_num_retry == MAX_RETRY_CONNECT_SYSTEM_AGENT) {
++            syslog(LOG_WARNING,
++                   "Failed to connect to spice-vdagentd at %s (tried %d times)",
++                   vdagentd_socket, agent->udscs_num_retry);
++            goto err_init;
++        }
++        if (agent->udscs_num_retry == 0) {
++            /* Log only when it fails and at the end */
++            syslog(LOG_DEBUG,
++                   "Failed to connect with spice-vdagentd. Trying again in 1s");
++        }
++        agent->udscs_num_retry++;
+         g_timeout_add_seconds(1, vdagent_init_async_cb, agent);
+         return G_SOURCE_REMOVE;
+     }
++    if (agent->udscs_num_retry != 0) {
++        syslog(LOG_DEBUG,
++               "Connected with spice-vdagentd after %d attempts",
++               agent->udscs_num_retry);
++    }
++    agent->udscs_num_retry = 0;
+     g_object_set_data(G_OBJECT(agent->conn), "agent", agent);
+ 
+     agent->display = vdagent_display_create(agent->conn, debug, x11_sync);
+-- 
+2.33.1
+
