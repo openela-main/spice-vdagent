@@ -1,0 +1,98 @@
+From 09de02fd5cb12fcda3326e243981750c5358b7b6 Mon Sep 17 00:00:00 2001
+From: Victor Toso <victortoso@redhat.com>
+Date: Mon, 20 Dec 2021 19:09:37 +0100
+Subject: [PATCH 3/3] udscs: udscs_connect: return error to caller
+
+This way we can have the log in one place and avoid flooding the journal.
+
+Signed-off-by: Victor Toso <victortoso@redhat.com>
+---
+ src/udscs.c           | 10 ++++------
+ src/udscs.h           |  5 ++++-
+ src/vdagent/vdagent.c | 12 +++++++++---
+ 3 files changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/src/udscs.c b/src/udscs.c
+index 3df67b3..6c50f76 100644
+--- a/src/udscs.c
++++ b/src/udscs.c
+@@ -107,16 +107,14 @@ static void udscs_connection_class_init(UdscsConnectionClass *klass)
+ UdscsConnection *udscs_connect(const char *socketname,
+     udscs_read_callback read_callback,
+     VDAgentConnErrorCb error_cb,
+-    int debug)
++    int debug,
++    GError **err)
+ {
+     GIOStream *io_stream;
+     UdscsConnection *conn;
+-    GError *err = NULL;
+ 
+-    io_stream = vdagent_socket_connect(socketname, &err);
+-    if (err) {
+-        syslog(LOG_ERR, "%s: %s", __func__, err->message);
+-        g_error_free(err);
++    io_stream = vdagent_socket_connect(socketname, err);
++    if (*err) {
+         return NULL;
+     }
+ 
+diff --git a/src/udscs.h b/src/udscs.h
+index 4f7ea36..0d4197b 100644
+--- a/src/udscs.h
++++ b/src/udscs.h
+@@ -53,11 +53,14 @@ typedef void (*udscs_read_callback)(UdscsConnection *conn,
+  *
+  * If debug is true then the events on this connection will be traced.
+  * This includes the incoming and outgoing message names.
++ *
++ * In case of failure, returns NULL and set @err with reason.
+  */
+ UdscsConnection *udscs_connect(const char *socketname,
+     udscs_read_callback read_callback,
+     VDAgentConnErrorCb error_cb,
+-    int debug);
++    int debug,
++    GError **err);
+ 
+ /* Queue a message for delivery to the client connected through conn.
+  */
+diff --git a/src/vdagent/vdagent.c b/src/vdagent/vdagent.c
+index 0d3945e..05d1a8f 100644
+--- a/src/vdagent/vdagent.c
++++ b/src/vdagent/vdagent.c
+@@ -376,22 +376,28 @@ static void vdagent_destroy(VDAgent *agent)
+ static gboolean vdagent_init_async_cb(gpointer user_data)
+ {
+     VDAgent *agent = user_data;
++    GError *err = NULL;
+ 
+     agent->conn = udscs_connect(vdagentd_socket,
+-                                daemon_read_complete, daemon_error_cb,
+-                                debug);
++                                daemon_read_complete,
++                                daemon_error_cb,
++                                debug,
++                                &err);
+     if (agent->conn == NULL) {
+         if (agent->udscs_num_retry == MAX_RETRY_CONNECT_SYSTEM_AGENT) {
+             syslog(LOG_WARNING,
+                    "Failed to connect to spice-vdagentd at %s (tried %d times)",
+                    vdagentd_socket, agent->udscs_num_retry);
++            g_error_free(err);
+             goto err_init;
+         }
+         if (agent->udscs_num_retry == 0) {
+             /* Log only when it fails and at the end */
+             syslog(LOG_DEBUG,
+-                   "Failed to connect with spice-vdagentd. Trying again in 1s");
++                   "Failed to connect with spice-vdagentd due '%s'. Trying again in 1s",
++                   err->message);
+         }
++        g_error_free(err);
+         agent->udscs_num_retry++;
+         g_timeout_add_seconds(1, vdagent_init_async_cb, agent);
+         return G_SOURCE_REMOVE;
+-- 
+2.33.1
+
